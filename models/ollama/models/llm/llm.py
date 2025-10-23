@@ -357,14 +357,16 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             if completion_type is LLMMode.CHAT:
                 if not chunk_json:
                     continue
-                msg = chunk_json.get("message", {}) or {}
+               msg_raw = chunk_json.get("message", {})
+               msg = msg_raw if isinstance(msg_raw, dict) else {}
                 text = msg.get("content", "")
                 response_tool_calls = msg.get("tool_calls", []) or []
-               tool_calls = []
+                tool_calls = []
                 for tool_call in response_tool_calls:
                     tc = self._extract_response_tool_call(tool_call)
                     if tc is not None:
                         tool_calls.append(tc)
+                assistant_prompt_message = AssistantPromptMessage(content=text, tool_calls=tool_calls)
             else:
                 if not chunk_json:
                     continue
