@@ -360,10 +360,11 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 msg = chunk_json.get("message", {}) or {}
                 text = msg.get("content", "")
                 response_tool_calls = msg.get("tool_calls", []) or []
-                tool_calls = [
-                    self._extract_response_tool_call(tool_call)
-                    for tool_call in response_tool_calls
-                ]
+               tool_calls = []
+                for tool_call in response_tool_calls:
+                    tc = self._extract_response_tool_call(tool_call)
+                    if tc is not None:
+                        tool_calls.append(tc)
             else:
                 if not chunk_json:
                     continue
