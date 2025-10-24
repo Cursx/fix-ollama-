@@ -308,6 +308,8 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         :param chunk_json: chunk json from Ollama response
         :param tool_calls: accumulated tool calls dict keyed by tool call id
         """
+        if not chunk_json:
+            return
         tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
             return
