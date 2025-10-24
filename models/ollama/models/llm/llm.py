@@ -317,7 +317,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             if not tool_id:
                 continue
             
-            function_data = tool_call_stream.get("function", {}) or {}
+            function_data = tool_call_stream.get("function", {})
             func_name = function_data.get("name")
             if not func_name:
                 continue
