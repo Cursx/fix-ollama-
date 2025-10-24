@@ -357,15 +357,21 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             if completion_type is LLMMode.CHAT:
                 if not chunk_json:
                     continue
-                if "message" not in chunk_json:
-                    text = ""
-                else:
-                    text = chunk_json.get("message").get("content", "")
+                msg = chunk_json.get("message")
+                msg = msg if isinstance(msg, dict) else {}
+                text = msg.get("content", "")
+                response_tool_calls = msg.get("tool_calls", [])
+                tool_calls = []
+                for tool_call in response_tool_calls:
+                    tc = self._extract_response_tool_call(tool_call)
+                    if tc is not None:
+                        tool_calls.append(tc)
+                assistant_prompt_message = AssistantPromptMessage(content=text, tool_calls=tool_calls)
             else:
                 if not chunk_json:
                     continue
                 text = chunk_json["response"]
-            assistant_prompt_message = AssistantPromptMessage(content=text)
+                assistant_prompt_message = AssistantPromptMessage(content=text)
             full_text += text
             if chunk_json["done"]:
                 if "prompt_eval_count" in chunk_json:
@@ -525,6 +531,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         ):
             extras["features"].append(ModelFeature.TOOL_CALL)
             extras["features"].append(ModelFeature.MULTI_TOOL_CALL)
+            extras["features"].append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
             label=I18nObject(zh_Hans=model, en_US=model),
