@@ -322,6 +322,9 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             function_data = tool_call_stream.get("function", {})
             func_name = function_data.get("name")
             if not func_name:
+                logger.warning("Function name is missing in tool call stream.")
+                continue
+            if not func_name:
                 continue
             
             # New tool call
