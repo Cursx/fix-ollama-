@@ -525,6 +525,8 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         ):
             extras["features"].append(ModelFeature.TOOL_CALL)
             extras["features"].append(ModelFeature.MULTI_TOOL_CALL)
+            # 默认：支持 tool_call 时同时启用 stream-tool-call
+            extras["features"].append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
             label=I18nObject(zh_Hans=model, en_US=model),
