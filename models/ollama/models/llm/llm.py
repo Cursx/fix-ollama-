@@ -401,7 +401,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     text = chunk_json.get("message").get("content", "")
                     
                 # Handle tool calls in stream
-                if "message" in chunk_json and "tool_calls" in chunk_json["message"]:
+                if chunk_json.get("message", {}).get("tool_calls"):
                     self._handle_tool_call_stream(chunk_json, tool_calls)
             else:
                 if not chunk_json:
