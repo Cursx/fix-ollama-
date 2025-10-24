@@ -301,18 +301,14 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         )
         return result
 
-    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: list, incremental_output: bool = True):
+    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: list):
         """
-        Handle tool call stream response, similar to Tongyi implementation
+        Handle tool call stream response.
         
         :param chunk_json: chunk json from Ollama response
         :param tool_calls: accumulated tool calls list
-        :param incremental_output: whether to use incremental output
         """
-        if "message" not in chunk_json or "tool_calls" not in chunk_json["message"]:
-            return
-            
-        tool_calls_stream = chunk_json["message"]["tool_calls"]
+        tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
             return
             
@@ -323,13 +319,9 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             if not func_name:
                 continue
                 
-            # Find existing tool call with same function name or add new one
-            existing_tool_call = None
-            for existing in tool_calls:
-                if existing.get("function", {}).get("name") == func_name:
-                    existing_tool_call = existing
-                    break
-                    
+            # Find existing tool call with same function name
+            existing_tool_call = next((tc for tc in tool_calls if tc.get("function", {}).get("name") == func_name), None)
+                
             if existing_tool_call is None:
                 # Add new tool call
                 tool_calls.append({
@@ -341,17 +333,11 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     }
                 })
             else:
-                # Update existing tool call
-                if incremental_output:
-                    # For incremental output, append arguments
-                    args = tool_call_stream.get("function", {}).get("arguments", "")
-                    if args:
-                        existing_tool_call["function"]["arguments"] += args
-                else:
-                    # For non-incremental output, replace arguments
-                    args = tool_call_stream.get("function", {}).get("arguments", "")
-                    if args:
-                        existing_tool_call["function"]["arguments"] = args
+                # Update existing tool call.
+                # As per the comment, Ollama provides complete tool calls, so we replace arguments.
+                args = tool_call_stream.get("function", {}).get("arguments", "")
+                if args:
+                    existing_tool_call["function"]["arguments"] = args
 
     def _handle_generate_stream_response(
         self,
@@ -417,7 +403,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     
                 # Handle tool calls in stream
                 if "message" in chunk_json and "tool_calls" in chunk_json["message"]:
-                    self._handle_tool_call_stream(chunk_json, tool_calls, incremental_output=True)
+                    self._handle_tool_call_stream(chunk_json, tool_calls)
             else:
                 if not chunk_json:
                     continue
@@ -427,9 +413,8 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             
             # Add accumulated tool calls to the message
             if tool_calls:
-                message_tool_calls = []
-                for tool_call_obj in tool_calls:
-                    message_tool_call = AssistantPromptMessage.ToolCall(
+                assistant_prompt_message.tool_calls = [
+                    AssistantPromptMessage.ToolCall(
                         id=tool_call_obj.get("id", tool_call_obj["function"]["name"]),
                         type="function",
                         function=AssistantPromptMessage.ToolCall.ToolCallFunction(
@@ -437,8 +422,8 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                             arguments=tool_call_obj["function"]["arguments"],
                         ),
                     )
-                    message_tool_calls.append(message_tool_call)
-                assistant_prompt_message.tool_calls = message_tool_calls
+                    for tool_call_obj in tool_calls
+                ]
                 
             full_text += text
             if chunk_json["done"]:
@@ -599,7 +584,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         ):
             extras["features"].append(ModelFeature.TOOL_CALL)
             extras["features"].append(ModelFeature.MULTI_TOOL_CALL)
-            # By default, enable stream-tool-call when tool_call is supported
+            # 默认：支持 tool_call 时同时启用 stream-tool-call
             extras["features"].append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
