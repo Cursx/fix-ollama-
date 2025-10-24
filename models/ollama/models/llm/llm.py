@@ -301,6 +301,34 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         )
         return result
 
+    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: dict):
+        """
+        Handle tool call stream response.
+        
+        :param chunk_json: chunk json from Ollama response
+        :param tool_calls: accumulated tool calls dict keyed by function name
+        """
+        tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
+        if not tool_calls_stream:
+            return
+        
+        for tool_call_stream in tool_calls_stream:
+            func_name = tool_call_stream.get("function", {}).get("name")
+            if not func_name:
+                continue
+        
+            args = tool_call_stream.get("function", {}).get("arguments", "")
+        
+            if func_name not in tool_calls:
+                tool_calls[func_name] = {
+                    "id": tool_call_stream.get("id", func_name),
+                    "type": "function",
+                    "function": {"name": func_name, "arguments": args},
+                }
+            else:
+                # Always replace arguments to reflect latest state, even if empty string
+                tool_calls[func_name]["function"]["arguments"] = args
+
     def _handle_generate_stream_response(
         self,
         model: str,
@@ -321,6 +349,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         """
         full_text = ""
         chunk_index = 0
+        tool_calls = {}  # Accumulate tool calls across chunks
 
         def create_final_llm_result_chunk(
             index: int, message: AssistantPromptMessage, finish_reason: str
@@ -361,11 +390,31 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     text = ""
                 else:
                     text = chunk_json.get("message").get("content", "")
+                    
+                # Handle tool calls in stream
+                if "message" in chunk_json and "tool_calls" in chunk_json["message"]:
+                    self._handle_tool_call_stream(chunk_json, tool_calls)
             else:
                 if not chunk_json:
                     continue
                 text = chunk_json["response"]
+                
             assistant_prompt_message = AssistantPromptMessage(content=text)
+            
+            # Add accumulated tool calls to the message
+            if tool_calls:
+                assistant_prompt_message.tool_calls = [
+                    AssistantPromptMessage.ToolCall(
+                        id=tool_call_obj.get("id", tool_call_obj["function"]["name"]),
+                        type="function",
+                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=tool_call_obj["function"]["name"],
+                            arguments=tool_call_obj["function"]["arguments"],
+                        ),
+                    )
+                    for tool_call_obj in tool_calls.values()
+                ]
+                
             full_text += text
             if chunk_json["done"]:
                 if "prompt_eval_count" in chunk_json:
@@ -525,6 +574,8 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         ):
             extras["features"].append(ModelFeature.TOOL_CALL)
             extras["features"].append(ModelFeature.MULTI_TOOL_CALL)
+            # 默认：支持 tool_call 时同时启用 stream-tool-call
+            extras["features"].append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
             label=I18nObject(zh_Hans=model, en_US=model),
