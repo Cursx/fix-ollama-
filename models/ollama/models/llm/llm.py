@@ -301,43 +301,33 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         )
         return result
 
-    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: list):
+    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: dict):
         """
         Handle tool call stream response.
         
         :param chunk_json: chunk json from Ollama response
-        :param tool_calls: accumulated tool calls list
+        :param tool_calls: accumulated tool calls dict keyed by function name
         """
         tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
             return
-            
+        
         for tool_call_stream in tool_calls_stream:
-            # Ollama typically provides complete tool calls, not incremental
-            # So we merge by function name rather than index
             func_name = tool_call_stream.get("function", {}).get("name")
             if not func_name:
                 continue
-                
-            # Find existing tool call with same function name
-            existing_tool_call = next((tc for tc in tool_calls if tc.get("function", {}).get("name") == func_name), None)
-                
-            if existing_tool_call is None:
-                # Add new tool call
-                tool_calls.append({
+        
+            args = tool_call_stream.get("function", {}).get("arguments", "")
+        
+            if func_name not in tool_calls:
+                tool_calls[func_name] = {
                     "id": tool_call_stream.get("id", func_name),
                     "type": "function",
-                    "function": {
-                        "name": func_name,
-                        "arguments": tool_call_stream.get("function", {}).get("arguments", "")
-                    }
-                })
+                    "function": {"name": func_name, "arguments": args},
+                }
             else:
-                # Update existing tool call.
-                # As per the comment, Ollama provides complete tool calls, so we replace arguments.
-                args = tool_call_stream.get("function", {}).get("arguments", "")
-                if args:
-                    existing_tool_call["function"]["arguments"] = args
+                # Always replace arguments to reflect latest state, even if empty string
+                tool_calls[func_name]["function"]["arguments"] = args
 
     def _handle_generate_stream_response(
         self,
@@ -359,7 +349,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         """
         full_text = ""
         chunk_index = 0
-        tool_calls = []  # Accumulate tool calls across chunks
+        tool_calls = {}  # Accumulate tool calls across chunks
 
         def create_final_llm_result_chunk(
             index: int, message: AssistantPromptMessage, finish_reason: str
@@ -422,7 +412,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                             arguments=tool_call_obj["function"]["arguments"],
                         ),
                     )
-                    for tool_call_obj in tool_calls
+                    for tool_call_obj in tool_calls.values()
                 ]
                 
             full_text += text
