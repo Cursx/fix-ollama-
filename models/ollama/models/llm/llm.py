@@ -306,28 +306,37 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         Handle tool call stream response.
         
         :param chunk_json: chunk json from Ollama response
-        :param tool_calls: accumulated tool calls dict keyed by function name
+        :param tool_calls: accumulated tool calls dict keyed by tool call id
         """
         tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
             return
         
         for tool_call_stream in tool_calls_stream:
-            func_name = tool_call_stream.get("function", {}).get("name")
+            tool_id = tool_call_stream.get("id")
+            if not tool_id:
+                continue
+            
+            function_data = tool_call_stream.get("function", {}) or {}
+            func_name = function_data.get("name")
             if not func_name:
                 continue
-        
-            args = tool_call_stream.get("function", {}).get("arguments", "")
-        
-            if func_name not in tool_calls:
-                tool_calls[func_name] = {
-                    "id": tool_call_stream.get("id", func_name),
-                    "type": "function",
-                    "function": {"name": func_name, "arguments": args},
-                }
+            
+            # New tool call
+            if tool_id not in tool_calls:
+                tool_calls[tool_id] = AssistantPromptMessage.ToolCall(
+                    id=tool_id,
+                    type="function",
+                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                        name=func_name,
+                        arguments=function_data.get("arguments", "") or "",
+                    ),
+                )
+            # Existing tool call, append arguments chunk
             else:
-                # Always replace arguments to reflect latest state, even if empty string
-                tool_calls[func_name]["function"]["arguments"] = args
+                args_chunk = function_data.get("arguments", "")
+                if args_chunk:
+                    tool_calls[tool_id].function.arguments += args_chunk
 
     def _handle_generate_stream_response(
         self,
@@ -403,17 +412,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             
             # Add accumulated tool calls to the message
             if tool_calls:
-                assistant_prompt_message.tool_calls = [
-                    AssistantPromptMessage.ToolCall(
-                        id=tool_call_obj.get("id", tool_call_obj["function"]["name"]),
-                        type="function",
-                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                            name=tool_call_obj["function"]["name"],
-                            arguments=tool_call_obj["function"]["arguments"],
-                        ),
-                    )
-                    for tool_call_obj in tool_calls.values()
-                ]
+                assistant_prompt_message.tool_calls = list(tool_calls.values())
                 
             full_text += text
             if chunk_json["done"]:
