@@ -301,6 +301,58 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         )
         return result
 
+    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: list, incremental_output: bool = True):
+        """
+        Handle tool call stream response, similar to Tongyi implementation
+        
+        :param chunk_json: chunk json from Ollama response
+        :param tool_calls: accumulated tool calls list
+        :param incremental_output: whether to use incremental output
+        """
+        if "message" not in chunk_json or "tool_calls" not in chunk_json["message"]:
+            return
+            
+        tool_calls_stream = chunk_json["message"]["tool_calls"]
+        if not tool_calls_stream:
+            return
+            
+        for tool_call_stream in tool_calls_stream:
+            # Ollama typically provides complete tool calls, not incremental
+            # So we merge by function name rather than index
+            func_name = tool_call_stream.get("function", {}).get("name")
+            if not func_name:
+                continue
+                
+            # Find existing tool call with same function name or add new one
+            existing_tool_call = None
+            for existing in tool_calls:
+                if existing.get("function", {}).get("name") == func_name:
+                    existing_tool_call = existing
+                    break
+                    
+            if existing_tool_call is None:
+                # Add new tool call
+                tool_calls.append({
+                    "id": tool_call_stream.get("id", func_name),
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "arguments": tool_call_stream.get("function", {}).get("arguments", "")
+                    }
+                })
+            else:
+                # Update existing tool call
+                if incremental_output:
+                    # For incremental output, append arguments
+                    args = tool_call_stream.get("function", {}).get("arguments", "")
+                    if args:
+                        existing_tool_call["function"]["arguments"] += args
+                else:
+                    # For non-incremental output, replace arguments
+                    args = tool_call_stream.get("function", {}).get("arguments", "")
+                    if args:
+                        existing_tool_call["function"]["arguments"] = args
+
     def _handle_generate_stream_response(
         self,
         model: str,
@@ -321,6 +373,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         """
         full_text = ""
         chunk_index = 0
+        tool_calls = []  # Accumulate tool calls across chunks
 
         def create_final_llm_result_chunk(
             index: int, message: AssistantPromptMessage, finish_reason: str
@@ -361,11 +414,32 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     text = ""
                 else:
                     text = chunk_json.get("message").get("content", "")
+                    
+                # Handle tool calls in stream
+                if "message" in chunk_json and "tool_calls" in chunk_json["message"]:
+                    self._handle_tool_call_stream(chunk_json, tool_calls, incremental_output=True)
             else:
                 if not chunk_json:
                     continue
                 text = chunk_json["response"]
+                
             assistant_prompt_message = AssistantPromptMessage(content=text)
+            
+            # Add accumulated tool calls to the message
+            if tool_calls:
+                message_tool_calls = []
+                for tool_call_obj in tool_calls:
+                    message_tool_call = AssistantPromptMessage.ToolCall(
+                        id=tool_call_obj.get("id", tool_call_obj["function"]["name"]),
+                        type="function",
+                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=tool_call_obj["function"]["name"],
+                            arguments=tool_call_obj["function"]["arguments"],
+                        ),
+                    )
+                    message_tool_calls.append(message_tool_call)
+                assistant_prompt_message.tool_calls = message_tool_calls
+                
             full_text += text
             if chunk_json["done"]:
                 if "prompt_eval_count" in chunk_json:
