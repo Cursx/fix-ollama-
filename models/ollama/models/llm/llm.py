@@ -329,7 +329,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     type="function",
                     function=AssistantPromptMessage.ToolCall.ToolCallFunction(
                         name=func_name,
-                        arguments=function_data.get("arguments", "") or "",
+                        arguments=function_data.get("arguments", "")
                     ),
                 )
             # Existing tool call, append arguments chunk
