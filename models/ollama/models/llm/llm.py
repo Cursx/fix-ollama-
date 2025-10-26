@@ -306,45 +306,62 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         Handle tool call stream response.
         
         :param chunk_json: chunk json from Ollama response
-        :param tool_calls: accumulated tool calls dict keyed by tool call id
+        :param tool_calls: accumulated tool calls dict keyed by tool call id or index
         """
         tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
             return
         
+        # init sentinels
+        name_counts = tool_calls.get("__name_counts__")
+        if name_counts is None:
+            name_counts = {}
+            tool_calls["__name_counts__"] = name_counts
+        
         for tool_call_stream in tool_calls_stream:
-            tool_id = tool_call_stream.get("id")
             function_data = tool_call_stream.get("function", {}) or {}
             func_name = function_data.get("name")
+            # Some providers stream arguments first without name; skip until we see a name
             if not func_name:
+                # Try append to last known key when arguments arrive without name
+                last_key = tool_calls.get("__last_key__")
+                if last_key:
+                    args_chunk = function_data.get("arguments", "")
+                    if args_chunk:
+                        tool_calls[last_key].function.arguments += args_chunk
                 continue
             
-            # if no id provided, anchor to last created tool call
-            if not tool_id:
-                last_id = tool_calls.get("__last_id__")
-                if not last_id:
-                    continue
-                args_chunk = function_data.get("arguments", "")
-                if args_chunk:
-                    tool_calls[last_id].function.arguments += args_chunk
-                continue
+            # choose key: prefer id, then index, otherwise synthesize by name with counter
+            tool_id = tool_call_stream.get("id")
+            key = None
+            if tool_id:
+                key = tool_id
+            else:
+                idx = tool_call_stream.get("index")
+                if isinstance(idx, int):
+                    key = f"idx:{idx}"
+                else:
+                    count = name_counts.get(func_name, 0)
+                    key = f"name:{func_name}:{count}"
+                    if key not in tool_calls:
+                        name_counts[func_name] = count + 1
             
             # New tool call
-            if tool_id not in tool_calls:
-                tool_calls[tool_id] = AssistantPromptMessage.ToolCall(
-                    id=tool_id,
+            if key not in tool_calls:
+                tool_calls[key] = AssistantPromptMessage.ToolCall(
+                    id=tool_id or func_name,  # fall back id to name for downstream compatibility
                     type="function",
                     function=AssistantPromptMessage.ToolCall.ToolCallFunction(
                         name=func_name,
                         arguments=function_data.get("arguments", "") or "",
                     ),
                 )
-                tool_calls["__last_id__"] = tool_id
-            # Existing tool call, append arguments chunk
+                tool_calls["__last_key__"] = key
             else:
+                # Existing tool call, append arguments chunk
                 args_chunk = function_data.get("arguments", "")
                 if args_chunk:
-                    tool_calls[tool_id].function.arguments += args_chunk
+                    tool_calls[key].function.arguments += args_chunk
 
     def _handle_generate_stream_response(
         self,
@@ -418,8 +435,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 
             assistant_prompt_message = AssistantPromptMessage(content=text)
             
-            # Add accumulated tool calls to the message only on final chunk
-            # to avoid emitting partial arguments that may break downstream parsing
+            # Attach tool_calls only on final chunk; filter out sentinels
             if chunk_json.get("done") and tool_calls:
                 assistant_prompt_message.tool_calls = [
                     v for k, v in tool_calls.items() if not str(k).startswith("__")
