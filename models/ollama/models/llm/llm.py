@@ -308,23 +308,25 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         :param chunk_json: chunk json from Ollama response
         :param tool_calls: accumulated tool calls dict keyed by tool call id
         """
-        if not chunk_json:
-            return
         tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
             return
         
         for tool_call_stream in tool_calls_stream:
             tool_id = tool_call_stream.get("id")
-            if not tool_id:
-                continue
-            
-            function_data = tool_call_stream.get("function", {})
+            function_data = tool_call_stream.get("function", {}) or {}
             func_name = function_data.get("name")
             if not func_name:
-                logger.warning("Function name is missing in tool call stream.")
                 continue
-            if not func_name:
+            
+            # if no id provided, anchor to last created tool call
+            if not tool_id:
+                last_id = tool_calls.get("__last_id__")
+                if not last_id:
+                    continue
+                args_chunk = function_data.get("arguments", "")
+                if args_chunk:
+                    tool_calls[last_id].function.arguments += args_chunk
                 continue
             
             # New tool call
@@ -334,9 +336,10 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     type="function",
                     function=AssistantPromptMessage.ToolCall.ToolCallFunction(
                         name=func_name,
-                        arguments=function_data.get("arguments", "")
+                        arguments=function_data.get("arguments", "") or "",
                     ),
                 )
+                tool_calls["__last_id__"] = tool_id
             # Existing tool call, append arguments chunk
             else:
                 args_chunk = function_data.get("arguments", "")
@@ -406,7 +409,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     text = chunk_json.get("message").get("content", "")
                     
                 # Handle tool calls in stream
-                if chunk_json.get("message", {}).get("tool_calls"):
+                if "message" in chunk_json and "tool_calls" in chunk_json["message"]:
                     self._handle_tool_call_stream(chunk_json, tool_calls)
             else:
                 if not chunk_json:
@@ -415,10 +418,13 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 
             assistant_prompt_message = AssistantPromptMessage(content=text)
             
-            # Add accumulated tool calls to the message
-            if tool_calls:
-                assistant_prompt_message.tool_calls = list(tool_calls.values())
-                
+            # Add accumulated tool calls to the message only on final chunk
+            # to avoid emitting partial arguments that may break downstream parsing
+            if chunk_json.get("done") and tool_calls:
+                assistant_prompt_message.tool_calls = [
+                    v for k, v in tool_calls.items() if not str(k).startswith("__")
+                ]
+            
             full_text += text
             if chunk_json["done"]:
                 if "prompt_eval_count" in chunk_json:
@@ -578,7 +584,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         ):
             extras["features"].append(ModelFeature.TOOL_CALL)
             extras["features"].append(ModelFeature.MULTI_TOOL_CALL)
-            # By default, when tool_call is supported, stream-tool-call is also enabled.
+            # 默认：支持 tool_call 时同时启用 stream-tool-call
             extras["features"].append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
