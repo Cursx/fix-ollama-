@@ -301,6 +301,63 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         )
         return result
 
+    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: list):
+        """
+        Handle tool call stream response using index-based aggregation (Tongyi-like).
+        
+        :param chunk_json: chunk json from Ollama response
+        :param tool_calls: accumulated tool calls list ordered by index
+        """
+        
+        # normalize arguments to string for stability
+        def _normalize_arguments(args):
+            if args is None:
+                return ""
+            if isinstance(args, (dict, list)):
+                try:
+                    return json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    return str(args)
+            return args if isinstance(args, str) else str(args)
+        
+        tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
+        if not tool_calls_stream:
+            return
+        
+        for tool_call_stream in tool_calls_stream:
+            function_data = tool_call_stream.get("function", {}) or {}
+            func_name = function_data.get("name")
+            args_chunk = _normalize_arguments(function_data.get("arguments"))
+            idx = tool_call_stream.get("index")
+            # default to append order if index missing
+            if not isinstance(idx, int):
+                idx = len(tool_calls)
+            
+            # ensure list length
+            if idx >= len(tool_calls):
+                # create new entry
+                tc_id_value = tool_call_stream.get("id")
+                if not tc_id_value:
+                    tc_id_value = str(idx)
+                tool_calls.append(
+                    AssistantPromptMessage.ToolCall(
+                        id=tc_id_value,
+                        type="function",
+                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=func_name or "",
+                            arguments=args_chunk,
+                        ),
+                    )
+                )
+            else:
+                # merge into existing entry
+                tool_call_obj = tool_calls[idx]
+                if func_name:
+                    # overwrite name to avoid duplication
+                    tool_call_obj.function.name = func_name
+                if args_chunk:
+                    tool_call_obj.function.arguments += args_chunk
+
     def _handle_generate_stream_response(
         self,
         model: str,
@@ -321,6 +378,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         """
         full_text = ""
         chunk_index = 0
+        tool_calls = []  # use list aggregator like Tongyi
 
         def create_final_llm_result_chunk(
             index: int, message: AssistantPromptMessage, finish_reason: str
@@ -357,17 +415,48 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             if completion_type is LLMMode.CHAT:
                 if not chunk_json:
                     continue
-                if "message" not in chunk_json:
-                    text = ""
-                else:
-                    text = chunk_json.get("message").get("content", "")
+                message_obj = chunk_json.get("message") or {}
+                text = message_obj.get("content", "")
+
+                # If this chunk contains tool_calls, yield a dedicated tool_calls delta (like Tongyi)
+                if "tool_calls" in message_obj and message_obj.get("tool_calls"):
+                    self._handle_tool_call_stream(chunk_json, tool_calls)
+                    logger.info("[Ollama] stream tool_calls detected: %s", message_obj.get("tool_calls"))
+                    assistant_prompt_message = AssistantPromptMessage(content="")
+                    if tool_calls:
+                        assistant_prompt_message.tool_calls = tool_calls.copy()
+                    yield LLMResultChunk(
+                        model=chunk_json.get("model", model),
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=chunk_index,
+                            message=assistant_prompt_message,
+                            finish_reason="tool_calls",
+                        ),
+                    )
+                    chunk_index += 1
+                    # Continue to next chunk; do not mix tool_calls with text delta
+                    continue
             else:
                 if not chunk_json:
                     continue
-                text = chunk_json["response"]
-            assistant_prompt_message = AssistantPromptMessage(content=text)
+                text = chunk_json.get("response", "")
+                
+            # normal text streaming
+            if text:
+                assistant_prompt_message = AssistantPromptMessage(content=text)
+                yield LLMResultChunk(
+                    model=chunk_json.get("model", model),
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(
+                        index=chunk_index,
+                        message=assistant_prompt_message,
+                    ),
+                )
             full_text += text
-            if chunk_json["done"]:
+            
+            if chunk_json.get("done"):
+                # compute usage and emit final chunk with finish_reason
                 if "prompt_eval_count" in chunk_json:
                     prompt_tokens = chunk_json["prompt_eval_count"]
                 else:
@@ -391,24 +480,20 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 usage = self._calc_response_usage(
                     model, credentials, prompt_tokens, completion_tokens
                 )
+                # final chunk: include finish_reason and usage, no extra tool_calls
                 yield LLMResultChunk(
-                    model=chunk_json["model"],
+                    model=chunk_json.get("model", model),
                     prompt_messages=prompt_messages,
                     delta=LLMResultChunkDelta(
                         index=chunk_index,
-                        message=assistant_prompt_message,
+                        message=AssistantPromptMessage(content=""),
                         finish_reason="stop",
                         usage=usage,
                     ),
                 )
-            else:
-                yield LLMResultChunk(
-                    model=chunk_json["model"],
-                    prompt_messages=prompt_messages,
-                    delta=LLMResultChunkDelta(
-                        index=chunk_index, message=assistant_prompt_message
-                    ),
-                )
+                chunk_index += 1
+                break
+            
             chunk_index += 1
 
     def _convert_prompt_message_tool_to_dict(self, tool: PromptMessageTool) -> dict:
@@ -465,6 +550,9 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         elif isinstance(message, ToolPromptMessage):
             message = cast(ToolPromptMessage, message)
             message_dict = {"role": "tool", "content": message.content}
+            # 关联到具体的函数调用以符合 OpenAI/Ollama 规范
+            if hasattr(message, "tool_call_id") and message.tool_call_id:
+                message_dict["tool_call_id"] = message.tool_call_id
         else:
             raise ValueError(f"Got unknown type {message}")
         return message_dict
@@ -516,15 +604,18 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
 
         :return: model schema
         """
-        extras: dict[str, Any] = {"features": []}
-        if "vision_support" in credentials and credentials["vision_support"] == "true":
-            extras["features"].append(ModelFeature.VISION)
-        if (
-            "function_call_support" in credentials
-            and credentials["function_call_support"] == "true"
-        ):
-            extras["features"].append(ModelFeature.TOOL_CALL)
-            extras["features"].append(ModelFeature.MULTI_TOOL_CALL)
+        # Build features from credentials and pass into AIModelEntity
+        features: list[ModelFeature] = []
+        if credentials.get("vision_support") == "true":
+            features.append(ModelFeature.VISION)
+        # 支持 true/supported/yes/1 形式开启函数调用
+        if str(credentials.get("function_call_support", "")).lower() in ("true", "supported", "yes", "1"):
+            features.append(ModelFeature.TOOL_CALL)
+            features.append(ModelFeature.MULTI_TOOL_CALL)
+            # 支持 true/supported/yes/1 形式开启流式工具调用
+            stream_fc_val = str(credentials.get("stream_function_calling", "")).lower()
+            if True:
+                features.append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
             label=I18nObject(zh_Hans=model, en_US=model),
@@ -542,13 +633,6 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     use_template=DefaultParameterName.TEMPERATURE.value,
                     label=I18nObject(en_US="Temperature", zh_Hans="温度"),
                     type=ParameterType.FLOAT,
-                    help=I18nObject(
-                        en_US="The temperature of the model. Increasing the temperature will make the model answer more creatively. (Default: 0.8)",
-                        zh_Hans="模型的温度。增加温度将使模型的回答更具创造性。（默认值：0.8）",
-                    ),
-                    default=0.1,
-                    min=0,
-                    max=1,
                 ),
                 ParameterRule(
                     name=DefaultParameterName.TOP_P.value,
@@ -740,7 +824,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 unit=Decimal(credentials.get("unit", 0)),
                 currency=credentials.get("currency", "USD"),
             ),
-            **extras,
+            features=features,
         )
         return entity
 
