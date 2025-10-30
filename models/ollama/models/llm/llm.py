@@ -473,11 +473,25 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     continue
                 text = chunk_json.get("response", "")
                 
-            # normal text streaming: preserve pure text behavior; apply delta-only after tool_calls
+            # normal text streaming: compute delta/full first, then micro-chunk uniformly
             if text:
-                # If upstream returns one large block, micro-chunk locally for responsiveness
-                if len(text) > micro_chunk_size:
-                    for piece in _yield_micro_chunks(text, micro_chunk_size):
+                text_to_yield = ""
+                if tool_phase:
+                    # delta-only: only yield newly added part after tool_calls
+                    if full_text and text.startswith(full_text):
+                        text_to_yield = text[len(full_text):]
+                        full_text = text
+                    else:
+                        text_to_yield = text
+                        full_text += text_to_yield
+                else:
+                    # pure text phase: yield text as-is
+                    text_to_yield = text
+                    full_text += text_to_yield
+
+                if text_to_yield:
+                    # Micro-chunk for finer granularity and consistent UX
+                    for piece in _yield_micro_chunks(text_to_yield, micro_chunk_size):
                         if not piece:
                             continue
                         assistant_prompt_message = AssistantPromptMessage(content=piece)
@@ -489,53 +503,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                                 message=assistant_prompt_message,
                             ),
                         )
-                        full_text += piece
                         chunk_index += 1
-                    text = ""
-
-                if tool_phase:
-                    # delta-only: only yield newly added part after tool_calls
-                    if full_text and text.startswith(full_text):
-                        delta_text = text[len(full_text):]
-                        is_cumulative = True
-                    else:
-                        delta_text = text
-                        is_cumulative = False
-
-                    if delta_text:
-                        # Micro-chunk the delta_text for finer granularity
-                        for piece in _yield_micro_chunks(delta_text, micro_chunk_size):
-                            if not piece:
-                                continue
-                            assistant_prompt_message = AssistantPromptMessage(content=piece)
-                            yield LLMResultChunk(
-                                model=chunk_json.get("model", model),
-                                prompt_messages=prompt_messages,
-                                delta=LLMResultChunkDelta(
-                                    index=chunk_index,
-                                    message=assistant_prompt_message,
-                                ),
-                            )
-                            chunk_index += 1
-
-                    # Maintain full_text
-                    if is_cumulative:
-                        full_text = text
-                    else:
-                        full_text += delta_text
-                else:
-                    # pure text phase: yield text as-is
-                    assistant_prompt_message = AssistantPromptMessage(content=text)
-                    yield LLMResultChunk(
-                        model=chunk_json.get("model", model),
-                        prompt_messages=prompt_messages,
-                        delta=LLMResultChunkDelta(
-                            index=chunk_index,
-                            message=assistant_prompt_message,
-                        ),
-                    )
-                    full_text += text
-                    chunk_index += 1
             
             if chunk_json.get("done"):
                 # compute usage and emit final chunk with finish_reason
