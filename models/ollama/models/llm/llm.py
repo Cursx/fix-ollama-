@@ -331,23 +331,23 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             idx = tool_call_stream.get("index")
             # default to append order if index missing
             if not isinstance(idx, int):
+                # place at next available position
                 idx = len(tool_calls)
-            
-            # ensure list length
+
+            # ensure list has enough space for the current index
             if idx >= len(tool_calls):
-                # create new entry
-                tc_id_value = tool_call_stream.get("id")
-                if not tc_id_value:
-                    tc_id_value = str(idx)
-                tool_calls.append(
-                    AssistantPromptMessage.ToolCall(
-                        id=tc_id_value,
-                        type="function",
-                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                            name=func_name or "",
-                            arguments=args_chunk,
-                        ),
-                    )
+                tool_calls.extend([None] * (idx - len(tool_calls) + 1))
+
+            # create new entry if it doesn't exist
+            if tool_calls[idx] is None:
+                tc_id_value = tool_call_stream.get("id") or str(idx)
+                tool_calls[idx] = AssistantPromptMessage.ToolCall(
+                    id=tc_id_value,
+                    type="function",
+                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                        name=func_name or "",
+                        arguments=args_chunk,
+                    ),
                 )
             else:
                 # merge into existing entry
