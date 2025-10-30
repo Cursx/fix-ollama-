@@ -301,67 +301,62 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         )
         return result
 
-    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: dict):
+    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: list):
         """
-        Handle tool call stream response.
+        Handle tool call stream response using index-based aggregation (Tongyi-like).
         
         :param chunk_json: chunk json from Ollama response
-        :param tool_calls: accumulated tool calls dict keyed by tool call id or index
+        :param tool_calls: accumulated tool calls list ordered by index
         """
+        
+        # normalize arguments to string for stability
+        def _normalize_arguments(args):
+            if args is None:
+                return ""
+            if isinstance(args, (dict, list)):
+                try:
+                    return json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    return str(args)
+            return args if isinstance(args, str) else str(args)
+        
         tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
             return
         
-        # init sentinels
-        name_counts = tool_calls.get("__name_counts__")
-        if name_counts is None:
-            name_counts = {}
-            tool_calls["__name_counts__"] = name_counts
-        
         for tool_call_stream in tool_calls_stream:
             function_data = tool_call_stream.get("function", {}) or {}
             func_name = function_data.get("name")
-            # Some providers stream arguments first without name; skip until we see a name
-            if not func_name:
-                # Try append to last known key when arguments arrive without name
-                last_key = tool_calls.get("__last_key__")
-                if last_key:
-                    args_chunk = function_data.get("arguments", "")
-                    if args_chunk:
-                        tool_calls[last_key].function.arguments += args_chunk
-                continue
+            args_chunk = _normalize_arguments(function_data.get("arguments"))
+            idx = tool_call_stream.get("index")
+            # default to append order if index missing
+            if not isinstance(idx, int):
+                idx = len(tool_calls)
             
-            # choose key: prefer id, then index, otherwise synthesize by name with counter
-            tool_id = tool_call_stream.get("id")
-            key = None
-            if tool_id:
-                key = tool_id
-            else:
-                idx = tool_call_stream.get("index")
-                if isinstance(idx, int):
-                    key = f"idx:{idx}"
-                else:
-                    count = name_counts.get(func_name, 0)
-                    key = f"name:{func_name}:{count}"
-                    if key not in tool_calls:
-                        name_counts[func_name] = count + 1
-            
-            # New tool call
-            if key not in tool_calls:
-                tool_calls[key] = AssistantPromptMessage.ToolCall(
-                    id=tool_id or func_name,  # fall back id to name for downstream compatibility
-                    type="function",
-                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                        name=func_name,
-                        arguments=function_data.get("arguments", "") or "",
-                    ),
+            # ensure list length
+            if idx >= len(tool_calls):
+                # create new entry
+                tc_id_value = tool_call_stream.get("id")
+                if not tc_id_value:
+                    tc_id_value = str(idx)
+                tool_calls.append(
+                    AssistantPromptMessage.ToolCall(
+                        id=tc_id_value,
+                        type="function",
+                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=func_name or "",
+                            arguments=args_chunk,
+                        ),
+                    )
                 )
-                tool_calls["__last_key__"] = key
             else:
-                # Existing tool call, append arguments chunk
-                args_chunk = function_data.get("arguments", "")
+                # merge into existing entry
+                tool_call_obj = tool_calls[idx]
+                if func_name:
+                    # overwrite name to avoid duplication
+                    tool_call_obj.function.name = func_name
                 if args_chunk:
-                    tool_calls[key].function.arguments += args_chunk
+                    tool_call_obj.function.arguments += args_chunk
 
     def _handle_generate_stream_response(
         self,
@@ -383,7 +378,35 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         """
         full_text = ""
         chunk_index = 0
-        tool_calls = {}  # Accumulate tool calls across chunks
+        tool_calls = []  # use list aggregator like Tongyi
+        tool_phase = False  # switch to delta-only text after detecting tool_calls
+        micro_chunk_size = 16  # mimic pure text small increments
+
+        def _yield_micro_chunks(s: str, size: int) -> list[str]:
+            """
+            Split by natural boundaries (spaces/newlines) to mimic pure text streaming.
+            Group tokens to approx `size` without emitting standalone "\n" chunks.
+            """
+            parts: list[str] = []
+            buffer = ""
+            # Split into whitespace and non-whitespace tokens, preserving separators
+            tokens = re.split(r"(\s+)", s)
+            for tok in tokens:
+                if tok is None:
+                    continue
+                # If current token would exceed size and buffer is not empty, flush
+                if buffer and len(buffer) + len(tok) > size:
+                    parts.append(buffer)
+                    buffer = tok
+                else:
+                    buffer += tok
+                # Prefer to flush at newline boundaries for responsiveness
+                if "\n" in tok and len(buffer) >= max(4, size // 2):
+                    parts.append(buffer)
+                    buffer = ""
+            if buffer:
+                parts.append(buffer)
+            return parts
 
         def create_final_llm_result_chunk(
             index: int, message: AssistantPromptMessage, finish_reason: str
@@ -420,29 +443,102 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             if completion_type is LLMMode.CHAT:
                 if not chunk_json:
                     continue
-                if "message" not in chunk_json:
-                    text = ""
+                message_obj = chunk_json.get("message") or {}
+                # Prefer incremental `response` for streaming; fallback to final `message.content`
+                if chunk_json.get("response") is not None:
+                    text = chunk_json.get("response", "")
                 else:
-                    text = chunk_json.get("message").get("content", "")
-                    
-                # Handle tool calls in stream
-                if "message" in chunk_json and "tool_calls" in chunk_json["message"]:
+                    text = message_obj.get("content", "")
+
+                # If this chunk contains tool_calls, yield a dedicated tool_calls delta (like Tongyi)
+                if "tool_calls" in message_obj and message_obj.get("tool_calls"):
                     self._handle_tool_call_stream(chunk_json, tool_calls)
+                    logger.info("[Ollama] stream tool_calls detected: %s", message_obj.get("tool_calls"))
+                    tool_phase = True
+                    assistant_prompt_message = AssistantPromptMessage(content="")
+                    if tool_calls:
+                        assistant_prompt_message.tool_calls = tool_calls.copy()
+                    yield LLMResultChunk(
+                        model=chunk_json.get("model", model),
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=chunk_index,
+                            message=assistant_prompt_message,
+                            finish_reason="tool_calls",
+                        ),
+                    )
+                    chunk_index += 1
             else:
                 if not chunk_json:
                     continue
-                text = chunk_json["response"]
+                text = chunk_json.get("response", "")
                 
-            assistant_prompt_message = AssistantPromptMessage(content=text)
+            # normal text streaming: preserve pure text behavior; apply delta-only after tool_calls
+            if text:
+                # If upstream returns one large block, micro-chunk locally for responsiveness
+                if len(text) > micro_chunk_size:
+                    for piece in _yield_micro_chunks(text, micro_chunk_size):
+                        if not piece:
+                            continue
+                        assistant_prompt_message = AssistantPromptMessage(content=piece)
+                        yield LLMResultChunk(
+                            model=chunk_json.get("model", model),
+                            prompt_messages=prompt_messages,
+                            delta=LLMResultChunkDelta(
+                                index=chunk_index,
+                                message=assistant_prompt_message,
+                            ),
+                        )
+                        full_text += piece
+                        chunk_index += 1
+                    text = ""
+
+                if tool_phase:
+                    # delta-only: only yield newly added part after tool_calls
+                    if full_text and text.startswith(full_text):
+                        delta_text = text[len(full_text):]
+                        is_cumulative = True
+                    else:
+                        delta_text = text
+                        is_cumulative = False
+
+                    if delta_text:
+                        # Micro-chunk the delta_text for finer granularity
+                        for piece in _yield_micro_chunks(delta_text, micro_chunk_size):
+                            if not piece:
+                                continue
+                            assistant_prompt_message = AssistantPromptMessage(content=piece)
+                            yield LLMResultChunk(
+                                model=chunk_json.get("model", model),
+                                prompt_messages=prompt_messages,
+                                delta=LLMResultChunkDelta(
+                                    index=chunk_index,
+                                    message=assistant_prompt_message,
+                                ),
+                            )
+                            chunk_index += 1
+
+                    # Maintain full_text
+                    if is_cumulative:
+                        full_text = text
+                    else:
+                        full_text += delta_text
+                else:
+                    # pure text phase: yield text as-is
+                    assistant_prompt_message = AssistantPromptMessage(content=text)
+                    yield LLMResultChunk(
+                        model=chunk_json.get("model", model),
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=chunk_index,
+                            message=assistant_prompt_message,
+                        ),
+                    )
+                    full_text += text
+                    chunk_index += 1
             
-            # Attach tool_calls only on final chunk; filter out sentinels
-            if chunk_json.get("done") and tool_calls:
-                assistant_prompt_message.tool_calls = [
-                    v for k, v in tool_calls.items() if not str(k).startswith("__")
-                ]
-            
-            full_text += text
-            if chunk_json["done"]:
+            if chunk_json.get("done"):
+                # compute usage and emit final chunk with finish_reason
                 if "prompt_eval_count" in chunk_json:
                     prompt_tokens = chunk_json["prompt_eval_count"]
                 else:
@@ -466,25 +562,20 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 usage = self._calc_response_usage(
                     model, credentials, prompt_tokens, completion_tokens
                 )
+                # final chunk: include finish_reason and usage, no extra tool_calls
                 yield LLMResultChunk(
-                    model=chunk_json["model"],
+                    model=chunk_json.get("model", model),
                     prompt_messages=prompt_messages,
                     delta=LLMResultChunkDelta(
                         index=chunk_index,
-                        message=assistant_prompt_message,
+                        message=AssistantPromptMessage(content=""),
                         finish_reason="stop",
                         usage=usage,
                     ),
                 )
-            else:
-                yield LLMResultChunk(
-                    model=chunk_json["model"],
-                    prompt_messages=prompt_messages,
-                    delta=LLMResultChunkDelta(
-                        index=chunk_index, message=assistant_prompt_message
-                    ),
-                )
-            chunk_index += 1
+                chunk_index += 1
+                break
+            
 
     def _convert_prompt_message_tool_to_dict(self, tool: PromptMessageTool) -> dict:
         """
@@ -540,6 +631,9 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         elif isinstance(message, ToolPromptMessage):
             message = cast(ToolPromptMessage, message)
             message_dict = {"role": "tool", "content": message.content}
+            # 关联到具体的函数调用以符合 OpenAI/Ollama 规范
+            if hasattr(message, "tool_call_id") and message.tool_call_id:
+                message_dict["tool_call_id"] = message.tool_call_id
         else:
             raise ValueError(f"Got unknown type {message}")
         return message_dict
@@ -591,17 +685,18 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
 
         :return: model schema
         """
-        extras: dict[str, Any] = {"features": []}
-        if "vision_support" in credentials and credentials["vision_support"] == "true":
-            extras["features"].append(ModelFeature.VISION)
-        if (
-            "function_call_support" in credentials
-            and credentials["function_call_support"] == "true"
-        ):
-            extras["features"].append(ModelFeature.TOOL_CALL)
-            extras["features"].append(ModelFeature.MULTI_TOOL_CALL)
-            # 默认：支持 tool_call 时同时启用 stream-tool-call
-            extras["features"].append(ModelFeature.STREAM_TOOL_CALL)
+        # Build features from credentials and pass into AIModelEntity
+        features: list[ModelFeature] = []
+        if credentials.get("vision_support") == "true":
+            features.append(ModelFeature.VISION)
+        # 支持 true/supported/yes/1 形式开启函数调用
+        if str(credentials.get("function_call_support", "")).lower() in ("true", "supported", "yes", "1"):
+            features.append(ModelFeature.TOOL_CALL)
+            features.append(ModelFeature.MULTI_TOOL_CALL)
+            # 支持 true/supported/yes/1 形式开启流式工具调用
+            stream_fc_val = str(credentials.get("stream_function_calling", "")).lower()
+            if True:
+                features.append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
             label=I18nObject(zh_Hans=model, en_US=model),
@@ -619,13 +714,6 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     use_template=DefaultParameterName.TEMPERATURE.value,
                     label=I18nObject(en_US="Temperature", zh_Hans="温度"),
                     type=ParameterType.FLOAT,
-                    help=I18nObject(
-                        en_US="The temperature of the model. Increasing the temperature will make the model answer more creatively. (Default: 0.8)",
-                        zh_Hans="模型的温度。增加温度将使模型的回答更具创造性。（默认值：0.8）",
-                    ),
-                    default=0.1,
-                    min=0,
-                    max=1,
                 ),
                 ParameterRule(
                     name=DefaultParameterName.TOP_P.value,
@@ -817,7 +905,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 unit=Decimal(credentials.get("unit", 0)),
                 currency=credentials.get("currency", "USD"),
             ),
-            **extras,
+            features=features,
         )
         return entity
 
