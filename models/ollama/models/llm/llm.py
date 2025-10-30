@@ -457,7 +457,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     tool_phase = True
                     assistant_prompt_message = AssistantPromptMessage(content="")
                     if tool_calls:
-                        assistant_prompt_message.tool_calls = tool_calls.copy()
+                        assistant_prompt_message.tool_calls = [tc for tc in tool_calls if tc is not None]
                     yield LLMResultChunk(
                         model=chunk_json.get("model", model),
                         prompt_messages=prompt_messages,
