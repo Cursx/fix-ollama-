@@ -316,9 +316,10 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             if isinstance(args, (dict, list)):
                 try:
                     return json.dumps(args, ensure_ascii=False)
-                except Exception:
-                    return str(args)
-            return args if isinstance(args, str) else str(args)
+                except Exception as e:
+                    logger.warning(f"Failed to serialize arguments to JSON: {e}")
+                    return str(args)  # Fallback to string conversion
+            return str(args)
         
         tool_calls_stream = chunk_json.get("message", {}).get("tool_calls")
         if not tool_calls_stream:
@@ -336,7 +337,11 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
 
             # ensure list has enough space for the current index
             if idx >= len(tool_calls):
-                tool_calls.extend([None] * (idx - len(tool_calls) + 1))
+                new_size = idx + 1  # Calculate the new size
+                if new_size > 1000:  # Add a check to prevent excessive memory allocation
+                    logger.warning(f"Tool call index {idx} exceeds maximum allowed size.")
+                    return  # Skip this tool call to prevent memory exhaustion
+                tool_calls.extend([None] * (new_size - len(tool_calls)))
 
             # create new entry if it doesn't exist
             if tool_calls[idx] is None:
@@ -663,7 +668,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             features.append(ModelFeature.MULTI_TOOL_CALL)
             # 支持 true/supported/yes/1 形式开启流式工具调用
             stream_fc_val = str(credentials.get("stream_function_calling", "")).lower()
-            if True:
+            if stream_fc_val in ("true", "supported", "yes", "1"):
                 features.append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
