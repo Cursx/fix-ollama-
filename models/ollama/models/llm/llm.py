@@ -387,10 +387,10 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         tool_phase = False  # switch to delta-only text after detecting tool_calls
         micro_chunk_size = 16  # mimic pure text small increments
 
-        def _yield_micro_chunks(s: str, size: int) -> list[str]:
+        def _yield_micro_chunks(s: str, size: int, min_size: int = 4) -> list[str]:
             """
             Split by natural boundaries (spaces/newlines) to mimic pure text streaming.
-            Group tokens to approx `size` without emitting standalone "\n" chunks.
+            Group tokens to approx `size` without emitting chunks smaller than `min_size` (except for newlines).
             """
             parts: list[str] = []
             buffer = ""
@@ -405,8 +405,8 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     buffer = tok
                 else:
                     buffer += tok
-                # Prefer to flush at newline boundaries for responsiveness
-                if "\n" in tok and len(buffer) >= max(4, size // 2):
+                # Prefer to flush at newline boundaries for responsiveness (respect min_size)
+                if "\n" in tok and len(buffer) >= max(min_size, size // 2):
                     parts.append(buffer)
                     buffer = ""
             if buffer:
@@ -464,7 +464,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                     if tool_calls:
                         assistant_prompt_message.tool_calls = [tc for tc in tool_calls if tc is not None]
                     yield LLMResultChunk(
-                        model=chunk_json.get("model", model),
+                        model=chunk_json.get("model", model or "default_model"),
                         prompt_messages=prompt_messages,
                         delta=LLMResultChunkDelta(
                             index=chunk_index,
@@ -487,8 +487,15 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                         text_to_yield = text[len(full_text):]
                         full_text = text
                     else:
-                        text_to_yield = text
-                        full_text += text_to_yield
+                        # If startswith fails, find longest common prefix
+                        common_prefix_len = 0
+                        for i in range(min(len(full_text), len(text))):
+                            if full_text[i] == text[i]:
+                                common_prefix_len += 1
+                            else:
+                                break
+                        text_to_yield = text[common_prefix_len:]
+                        full_text = text
                 else:
                     # pure text phase: yield text as-is
                     text_to_yield = text
@@ -501,7 +508,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                             continue
                         assistant_prompt_message = AssistantPromptMessage(content=piece)
                         yield LLMResultChunk(
-                            model=chunk_json.get("model", model),
+                            model=chunk_json.get("model", model or "default_model"),
                             prompt_messages=prompt_messages,
                             delta=LLMResultChunkDelta(
                                 index=chunk_index,
@@ -537,7 +544,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 )
                 # final chunk: include finish_reason and usage, no extra tool_calls
                 yield LLMResultChunk(
-                    model=chunk_json.get("model", model),
+                    model=chunk_json.get("model", model or "default_model"),
                     prompt_messages=prompt_messages,
                     delta=LLMResultChunkDelta(
                         index=chunk_index,
