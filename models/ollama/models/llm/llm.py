@@ -49,6 +49,11 @@ from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
 
 logger = logging.getLogger(__name__)
 
+# Module-level constants for readability and maintainability
+_MAX_TOOL_CALLS = 1000
+_MICRO_CHUNK_SIZE = 16
+_TRUTHY_VALUES = {"true", "supported", "yes", "1"}
+
 
 class OllamaLargeLanguageModel(LargeLanguageModel):
     """
@@ -301,12 +306,12 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         )
         return result
 
-    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls: list):
+    def _handle_tool_call_stream(self, chunk_json: dict, tool_calls_by_index: dict):
         """
         Handle tool call stream response using index-based aggregation (Tongyi-like).
         
         :param chunk_json: chunk json from Ollama response
-        :param tool_calls: accumulated tool calls list ordered by index
+        :param tool_calls_by_index: accumulated tool calls dict keyed by index
         """
         
         # normalize arguments to string for stability
@@ -332,21 +337,22 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             idx = tool_call_stream.get("index")
             # default to append order if index missing
             if not isinstance(idx, int):
-                # place at next available position
-                idx = len(tool_calls)
+                # place at next available position according to current max index
+                if tool_calls_by_index:
+                    idx = max(tool_calls_by_index.keys()) + 1
+                else:
+                    idx = 0
 
-            # ensure list has enough space for the current index
-            if idx >= len(tool_calls):
-                new_size = idx + 1  # Calculate the new size
-                if new_size > 1000:  # Add a check to prevent excessive memory allocation
-                    logger.warning(f"Tool call index {idx} exceeds maximum allowed size.")
-                    return  # Skip this tool call to prevent memory exhaustion
-                tool_calls.extend([None] * (new_size - len(tool_calls)))
+            # Prevent excessive index values from consuming memory
+            if idx >= _MAX_TOOL_CALLS:
+                logger.warning(f"Tool call index {idx} exceeds maximum allowed size {_MAX_TOOL_CALLS}.")
+                continue
 
             # create new entry if it doesn't exist
-            if tool_calls[idx] is None:
+            existing = tool_calls_by_index.get(idx)
+            if existing is None:
                 tc_id_value = tool_call_stream.get("id") or str(idx)
-                tool_calls[idx] = AssistantPromptMessage.ToolCall(
+                tool_calls_by_index[idx] = AssistantPromptMessage.ToolCall(
                     id=tc_id_value,
                     type="function",
                     function=AssistantPromptMessage.ToolCall.ToolCallFunction(
@@ -356,7 +362,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
                 )
             else:
                 # merge into existing entry
-                tool_call_obj = tool_calls[idx]
+                tool_call_obj = existing
                 if func_name:
                     # overwrite name to avoid duplication
                     tool_call_obj.function.name = func_name
@@ -383,9 +389,9 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         """
         full_text = ""
         chunk_index = 0
-        tool_calls = []  # use list aggregator like Tongyi
+        tool_calls_by_index = {}  # use dict aggregator to avoid sparse large lists
         tool_phase = False  # switch to delta-only text after detecting tool_calls
-        micro_chunk_size = 16  # mimic pure text small increments
+        micro_chunk_size = _MICRO_CHUNK_SIZE  # mimic pure text small increments
 
         def _yield_micro_chunks(s: str, size: int, min_size: int = 4) -> list[str]:
             """
@@ -397,7 +403,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             # Split into whitespace and non-whitespace tokens, preserving separators
             tokens = re.split(r"(\s+)", s)
             for tok in tokens:
-                if tok is None:
+                if not tok:
                     continue
                 # If current token would exceed size and buffer is not empty, flush
                 if buffer and len(buffer) + len(tok) > size:
@@ -457,12 +463,16 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
 
                 # If this chunk contains tool_calls, yield a dedicated tool_calls delta (like Tongyi)
                 if "tool_calls" in message_obj and message_obj.get("tool_calls"):
-                    self._handle_tool_call_stream(chunk_json, tool_calls)
+                    self._handle_tool_call_stream(chunk_json, tool_calls_by_index)
                     logger.info("[Ollama] stream tool_calls detected: %s", message_obj.get("tool_calls"))
                     tool_phase = True
                     assistant_prompt_message = AssistantPromptMessage(content="")
-                    if tool_calls:
-                        assistant_prompt_message.tool_calls = [tc for tc in tool_calls if tc is not None]
+                    if tool_calls_by_index:
+                        assistant_prompt_message.tool_calls = [
+                            tool_calls_by_index[i]
+                            for i in sorted(tool_calls_by_index)
+                            if tool_calls_by_index[i] is not None
+                        ]
                     yield LLMResultChunk(
                         model=chunk_json.get("model", model or "default_model"),
                         prompt_messages=prompt_messages,
@@ -670,13 +680,18 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
         if credentials.get("vision_support") == "true":
             features.append(ModelFeature.VISION)
         # 支持 true/supported/yes/1 形式开启函数调用
-        if str(credentials.get("function_call_support", "")).lower() in ("true", "supported", "yes", "1"):
+        fc_supported = str(credentials.get("function_call_support", "")).lower() in _TRUTHY_VALUES
+        if fc_supported:
             features.append(ModelFeature.TOOL_CALL)
             features.append(ModelFeature.MULTI_TOOL_CALL)
-            # 支持 true/supported/yes/1 形式开启流式工具调用
-            stream_fc_val = str(credentials.get("stream_function_calling", "")).lower()
-            if stream_fc_val in ("true", "supported", "yes", "1"):
+            # 说明：Dify 的 Ollama 配置页没有单独的 stream_function_calling 项；
+            # 若支持 function_call，则默认也支持流式工具调用（如需关闭，可在凭据中显式提供 false）。
+            stream_fc_cfg = credentials.get("stream_function_calling")
+            if stream_fc_cfg is None:
                 features.append(ModelFeature.STREAM_TOOL_CALL)
+            else:
+                if str(stream_fc_cfg).lower() in _TRUTHY_VALUES:
+                    features.append(ModelFeature.STREAM_TOOL_CALL)
         entity = AIModelEntity(
             model=model,
             label=I18nObject(zh_Hans=model, en_US=model),
