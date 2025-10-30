@@ -325,7 +325,7 @@ class OllamaLargeLanguageModel(LargeLanguageModel):
             return
         
         for tool_call_stream in tool_calls_stream:
-            function_data = tool_call_stream.get("function", {}) or {}
+            function_data = tool_call_stream.get("function", {})
             func_name = function_data.get("name")
             args_chunk = _normalize_arguments(function_data.get("arguments"))
             idx = tool_call_stream.get("index")
